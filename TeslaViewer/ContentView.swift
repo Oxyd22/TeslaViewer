@@ -2,58 +2,662 @@
 //  ContentView.swift
 //  TeslaViewer
 //
-//  Created by Daniel Riewe on 23.12.25.
+//  Tesla Dashcam & Sentry Mode Viewer for macOS
+//  Zeigt alle 6 Kameras synchron in einem 3x2 Grid.
 //
 
 import SwiftUI
-import SwiftData
+import AVKit
+import AVFoundation
+import Combine
+
+// MARK: - Datenmodelle
+
+struct EventReason {
+    let raw: String
+
+    var display: String {
+        switch raw {
+        case "sentry_aware_object_detection":          return "Objekt erkannt"
+        case "sentry_aware_acc_object_detection":      return "Objekt nahe Fahrzeug"
+        case "sentry_aware_body_cam_object_detection": return "Person erkannt"
+        case "user_interaction_dashcam_icon_tapped":   return "Manuell gespeichert"
+        case "user_interaction_dashcam_panel_save":    return "Manuell gespeichert"
+        case "user_interaction_honk":                  return "Hupe betätigt"
+        case "sentry_aware_collision":                 return "Kollision"
+        case "": return "Sentry-Ereignis"
+        default: return raw.replacingOccurrences(of: "_", with: " ").capitalized
+        }
+    }
+
+    var systemIcon: String {
+        switch raw {
+        case "sentry_aware_object_detection", "sentry_aware_acc_object_detection":
+            return "eye.fill"
+        case "sentry_aware_body_cam_object_detection":
+            return "figure.walk"
+        case "user_interaction_dashcam_icon_tapped", "user_interaction_dashcam_panel_save":
+            return "square.and.arrow.down"
+        case "user_interaction_honk":
+            return "speaker.wave.2.fill"
+        case "sentry_aware_collision":
+            return "exclamationmark.triangle.fill"
+        default:
+            return "video.fill"
+        }
+    }
+}
+
+struct SentryClip: Identifiable {
+    let id = UUID()
+    let clipTimestamp: Date
+    var cameraURLs: [String: URL] = [:]
+}
+
+struct SentryEvent: Identifiable, Hashable {
+    let id = UUID()
+    let folderURL: URL
+    let eventTimestamp: Date
+
+    var city: String?
+    var reason: String?
+    var thumbnailURL: URL?
+    var clips: [SentryClip] = []
+
+    var reasonInfo: EventReason { EventReason(raw: reason ?? "") }
+
+    var displayDate: String {
+        let f = DateFormatter()
+        f.dateStyle = .medium
+        f.timeStyle = .short
+        f.locale = Locale(identifier: "de_DE")
+        return f.string(from: eventTimestamp)
+    }
+
+    static func == (lhs: SentryEvent, rhs: SentryEvent) -> Bool { lhs.id == rhs.id }
+    func hash(into hasher: inout Hasher) { hasher.combine(id) }
+}
+
+// MARK: - Event-Loader
+
+enum EventLoader {
+    static let dateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd_HH-mm-ss"
+        f.locale = Locale(identifier: "en_US_POSIX")
+        return f
+    }()
+
+    static func loadEvents(from rootURL: URL) -> [SentryEvent] {
+        // Unterstützt: TeslaCam-Root, direkter SentryClips-Ordner, oder Unterordner
+        var searchURL = rootURL
+        if rootURL.lastPathComponent != "SentryClips" {
+            let candidate = rootURL.appendingPathComponent("SentryClips")
+            if FileManager.default.fileExists(atPath: candidate.path) {
+                searchURL = candidate
+            }
+        }
+
+        let folders = (try? FileManager.default.contentsOfDirectory(
+            at: searchURL,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: .skipsHiddenFiles
+        ))?.filter { $0.hasDirectoryPath } ?? []
+
+        return folders
+            .compactMap { parseEvent(at: $0) }
+            .sorted { $0.eventTimestamp > $1.eventTimestamp }
+    }
+
+    static func parseEvent(at folderURL: URL) -> SentryEvent? {
+        let name = folderURL.lastPathComponent
+        guard let date = dateFormatter.date(from: name) else { return nil }
+
+        var event = SentryEvent(folderURL: folderURL, eventTimestamp: date)
+
+        // event.json parsen
+        let jsonURL = folderURL.appendingPathComponent("event.json")
+        if let data = try? Data(contentsOf: jsonURL),
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            event.city = json["city"] as? String
+            event.reason = json["reason"] as? String
+        }
+
+        // Thumbnail
+        let thumb = folderURL.appendingPathComponent("thumb.png")
+        if FileManager.default.fileExists(atPath: thumb.path) {
+            event.thumbnailURL = thumb
+        }
+
+        // MP4-Dateien nach Timestamp-Prefix gruppieren
+        let mp4s = (try? FileManager.default.contentsOfDirectory(
+            at: folderURL, includingPropertiesForKeys: nil, options: .skipsHiddenFiles
+        ))?.filter { $0.pathExtension.lowercased() == "mp4" } ?? []
+
+        // Dateiname-Format: YYYY-MM-DD_HH-MM-SS-kameraname.mp4
+        // Timestamp ist immer 19 Zeichen, dann "-", dann Kameraname
+        var groups: [String: [URL]] = [:]
+        for url in mp4s {
+            let stem = url.deletingPathExtension().lastPathComponent
+            guard stem.count > 19 else { continue }
+            let prefix = String(stem.prefix(19))
+            groups[prefix, default: []].append(url)
+        }
+
+        event.clips = groups.compactMap { prefix, urls -> SentryClip? in
+            guard let clipDate = dateFormatter.date(from: prefix) else { return nil }
+            var clip = SentryClip(clipTimestamp: clipDate)
+            for url in urls {
+                let stem = url.deletingPathExtension().lastPathComponent
+                // Kameraname beginnt nach den 19 Timestamp-Zeichen + dem Trennzeichen "-"
+                if stem.count > 20 {
+                    clip.cameraURLs[String(stem.dropFirst(20))] = url
+                }
+            }
+            return clip
+        }.sorted { $0.clipTimestamp < $1.clipTimestamp }
+
+        return event
+    }
+}
+
+// MARK: - VideoPlayerManager
+
+class VideoPlayerManager: ObservableObject {
+    @Published var players: [String: AVPlayer] = [:]
+    @Published var isPlaying = false
+    @Published var currentTime: Double = 0
+    @Published var duration: Double = 60
+    @Published var currentClipIndex: Int = 0
+
+    private var clips: [SentryClip] = []
+    private var timeObserverToken: Any?
+    private var trackingPlayer: AVPlayer?
+    private var endObserver: NSObjectProtocol?
+
+    var totalClips: Int { clips.count }
+
+    func setup(clips: [SentryClip]) {
+        self.clips = clips
+        guard !clips.isEmpty else { return }
+        loadClip(at: 0)
+    }
+
+    func loadClip(at index: Int) {
+        guard clips.indices.contains(index) else { return }
+        removeObservers()
+
+        let clip = clips[index]
+        currentClipIndex = index
+        currentTime = 0
+        duration = 60 // Standard-Clip-Länge; wird sobald geladen überschrieben
+
+        // Neue Player erstellen
+        var newPlayers: [String: AVPlayer] = [:]
+        for (camera, url) in clip.cameraURLs {
+            newPlayers[camera] = AVPlayer(url: url)
+        }
+        players = newPlayers
+
+        // Primären Player für Zeitverfolgung wählen
+        guard let primaryURL = clip.cameraURLs["front"] ?? clip.cameraURLs.values.first,
+              let primary = newPlayers["front"] ?? newPlayers.values.first else { return }
+        trackingPlayer = primary
+
+        // Dauer asynchron laden (modernes async/await ab macOS 13)
+        let asset = AVURLAsset(url: primaryURL)
+        Task { @MainActor [weak self] in
+            if let cmDur = try? await asset.load(.duration) {
+                let dur = CMTimeGetSeconds(cmDur)
+                if !dur.isNaN && dur > 0 { self?.duration = dur }
+            }
+        }
+
+        // Zeitbeobachter
+        let interval = CMTime(seconds: 0.1, preferredTimescale: CMTimeScale(NSEC_PER_SEC))
+        timeObserverToken = primary.addPeriodicTimeObserver(
+            forInterval: interval, queue: .main
+        ) { [weak self] time in
+            let t = CMTimeGetSeconds(time)
+            if !t.isNaN { self?.currentTime = max(0, t) }
+        }
+
+        // Clip-Ende-Benachrichtigung
+        endObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemDidPlayToEndTime,
+            object: primary.currentItem,
+            queue: .main
+        ) { [weak self] _ in
+            self?.advanceToNextClip()
+        }
+
+        if isPlaying {
+            newPlayers.values.forEach { $0.play() }
+        }
+    }
+
+    func togglePlayback() {
+        isPlaying.toggle()
+        if isPlaying {
+            players.values.forEach { $0.play() }
+        } else {
+            players.values.forEach { $0.pause() }
+        }
+    }
+
+    func seekTo(time: Double) {
+        let t = CMTime(seconds: time, preferredTimescale: 600)
+        players.values.forEach { $0.seek(to: t, toleranceBefore: .zero, toleranceAfter: .zero) }
+    }
+
+    func advanceToNextClip() {
+        if currentClipIndex < clips.count - 1 {
+            loadClip(at: currentClipIndex + 1)
+        } else {
+            isPlaying = false
+            players.values.forEach { $0.pause() }
+        }
+    }
+
+    func goToPreviousClip() {
+        if currentClipIndex > 0 { loadClip(at: currentClipIndex - 1) }
+    }
+
+    private func removeObservers() {
+        if let token = timeObserverToken, let player = trackingPlayer {
+            player.removeTimeObserver(token)
+        }
+        timeObserverToken = nil
+        trackingPlayer = nil
+
+        if let obs = endObserver {
+            NotificationCenter.default.removeObserver(obs)
+            endObserver = nil
+        }
+        players.values.forEach { $0.pause() }
+    }
+
+    deinit { removeObservers() }
+}
+
+// MARK: - Haupt-Views
 
 struct ContentView: View {
-    @Environment(\.modelContext) private var modelContext
-    @Query private var items: [Item]
+    @State private var events: [SentryEvent] = []
+    @State private var selectedEvent: SentryEvent?
+    @State private var isLoading = false
 
     var body: some View {
         NavigationSplitView {
-            List {
-                ForEach(items) { item in
-                    NavigationLink {
-                        Text("Item at \(item.timestamp, format: Date.FormatStyle(date: .numeric, time: .standard))")
-                    } label: {
-                        Text(item.timestamp, format: Date.FormatStyle(date: .numeric, time: .standard))
-                    }
-                }
-                .onDelete(perform: deleteItems)
-            }
-            .navigationSplitViewColumnWidth(min: 180, ideal: 200)
-            .toolbar {
-                ToolbarItem {
-                    Button(action: addItem) {
-                        Label("Add Item", systemImage: "plus")
-                    }
-                }
-            }
+            SidebarView(
+                events: events,
+                selectedEvent: $selectedEvent,
+                isLoading: isLoading,
+                onSelectFolder: loadFolder
+            )
+            .frame(minWidth: 240)
         } detail: {
-            Text("Select an item")
+            if let event = selectedEvent {
+                VideoGridView(event: event)
+                    .id(event.id)
+            } else {
+                PlaceholderView(hasEvents: !events.isEmpty)
+            }
         }
     }
 
-    private func addItem() {
-        withAnimation {
-            let newItem = Item(timestamp: Date())
-            modelContext.insert(newItem)
-        }
-    }
+    private func loadFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.message = "TeslaCam-Ordner oder SentryClips-Ordner auswählen"
+        panel.prompt = "Öffnen"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
 
-    private func deleteItems(offsets: IndexSet) {
-        withAnimation {
-            for index in offsets {
-                modelContext.delete(items[index])
+        _ = url.startAccessingSecurityScopedResource()
+        isLoading = true
+        events = []
+        selectedEvent = nil
+
+        Task.detached(priority: .userInitiated) {
+            let loaded = EventLoader.loadEvents(from: url)
+            await MainActor.run {
+                self.events = loaded
+                self.selectedEvent = loaded.first
+                self.isLoading = false
             }
         }
     }
 }
 
-#Preview {
-    ContentView()
-        .modelContainer(for: Item.self, inMemory: true)
+// MARK: - Sidebar
+
+struct SidebarView: View {
+    let events: [SentryEvent]
+    @Binding var selectedEvent: SentryEvent?
+    let isLoading: Bool
+    let onSelectFolder: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Button(action: onSelectFolder) {
+                    Label("Öffnen", systemImage: "folder.badge.plus")
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+
+                Spacer()
+
+                if !events.isEmpty {
+                    Text("\(events.count) Ereignisse")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+            }
+            .padding(10)
+
+            Divider()
+
+            if isLoading {
+                Spacer()
+                ProgressView("Lade Ereignisse…")
+                Spacer()
+            } else if events.isEmpty {
+                Spacer()
+                VStack(spacing: 10) {
+                    Image(systemName: "car.fill")
+                        .font(.largeTitle)
+                        .foregroundColor(.secondary)
+                    Text("Kein Ordner geladen")
+                        .font(.callout)
+                        .foregroundColor(.secondary)
+                }
+                Spacer()
+            } else {
+                List(events, selection: $selectedEvent) { event in
+                    EventRowView(event: event).tag(event)
+                }
+                .listStyle(.sidebar)
+            }
+        }
+    }
+}
+
+struct EventRowView: View {
+    let event: SentryEvent
+
+    var body: some View {
+        HStack(spacing: 8) {
+            // Thumbnail
+            Group {
+                if let url = event.thumbnailURL, let img = NSImage(contentsOf: url) {
+                    Image(nsImage: img)
+                        .resizable()
+                        .aspectRatio(contentMode: .fill)
+                        .frame(width: 62, height: 40)
+                        .cornerRadius(5)
+                        .clipped()
+                } else {
+                    RoundedRectangle(cornerRadius: 5)
+                        .fill(Color.secondary.opacity(0.2))
+                        .frame(width: 62, height: 40)
+                        .overlay(
+                            Image(systemName: "video")
+                                .foregroundColor(.secondary)
+                        )
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(event.displayDate)
+                    .font(.caption).fontWeight(.semibold)
+                    .lineLimit(1)
+
+                if let city = event.city {
+                    Text(city)
+                        .font(.caption2).foregroundColor(.secondary)
+                        .lineLimit(1)
+                }
+
+                Label(event.reasonInfo.display, systemImage: event.reasonInfo.systemIcon)
+                    .font(.caption2)
+                    .foregroundColor(.orange)
+                    .lineLimit(1)
+
+                Text("\(event.clips.count) Clip\(event.clips.count == 1 ? "" : "s")")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+        }
+        .padding(.vertical, 3)
+    }
+}
+
+struct PlaceholderView: View {
+    let hasEvents: Bool
+
+    var body: some View {
+        VStack(spacing: 16) {
+            Image(systemName: hasEvents ? "car.rear.fill" : "folder.badge.plus")
+                .font(.system(size: 64))
+                .foregroundColor(.secondary)
+            Text(hasEvents ? "Ereignis aus der Liste wählen" : "TeslaCam-Ordner öffnen")
+                .font(.title2)
+                .foregroundColor(.secondary)
+        }
+    }
+}
+
+// MARK: - Video-Grid
+
+struct VideoGridView: View {
+    let event: SentryEvent
+    @StateObject private var manager = VideoPlayerManager()
+
+    // Kamera-Layout: 3 Spalten × 2 Zeilen
+    // [left_repeater] [  front  ] [right_repeater]
+    // [left_pillar  ] [  back   ] [right_pillar  ]
+    let layout: [[String]] = [
+        ["left_repeater", "front",  "right_repeater"],
+        ["left_pillar",   "back",   "right_pillar"]
+    ]
+
+    let cameraLabels: [String: String] = [
+        "front":           "Front",
+        "back":            "Hinten",
+        "left_repeater":   "Links",
+        "right_repeater":  "Rechts",
+        "left_pillar":     "Links hinten",
+        "right_pillar":    "Rechts hinten"
+    ]
+
+    var body: some View {
+        VStack(spacing: 0) {
+            headerBar
+            Divider()
+
+            if event.clips.isEmpty {
+                Spacer()
+                VStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle")
+                        .font(.largeTitle)
+                        .foregroundColor(.secondary)
+                    Text("Keine Videodateien gefunden")
+                        .foregroundColor(.secondary)
+                }
+                Spacer()
+            } else {
+                GeometryReader { geo in
+                    let colCount = 3
+                    let rowCount = 2
+                    let spacing: CGFloat = 2
+                    let w = (geo.size.width  - CGFloat(colCount - 1) * spacing) / CGFloat(colCount)
+                    let h = (geo.size.height - CGFloat(rowCount - 1) * spacing) / CGFloat(rowCount)
+
+                    VStack(spacing: spacing) {
+                        ForEach(0..<layout.count, id: \.self) { row in
+                            HStack(spacing: spacing) {
+                                ForEach(layout[row], id: \.self) { camera in
+                                    CameraCell(
+                                        player: manager.players[camera],
+                                        label: cameraLabels[camera] ?? camera
+                                    )
+                                    .frame(width: w, height: h)
+                                }
+                            }
+                        }
+                    }
+                }
+                .background(Color.black)
+            }
+
+            Divider()
+            controlBar
+        }
+        .onAppear { manager.setup(clips: event.clips) }
+    }
+
+    // MARK: Header
+
+    var headerBar: some View {
+        HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(event.displayDate)
+                    .font(.subheadline).fontWeight(.semibold)
+                if let city = event.city {
+                    Text(city)
+                        .font(.caption).foregroundColor(.secondary)
+                }
+            }
+
+            Spacer()
+
+            // Auslöse-Badge
+            Label(event.reasonInfo.display, systemImage: event.reasonInfo.systemIcon)
+                .font(.caption)
+                .padding(.horizontal, 8).padding(.vertical, 4)
+                .background(Color.orange.opacity(0.15))
+                .foregroundColor(.orange)
+                .cornerRadius(6)
+
+            // Clip-Navigation (nur bei mehreren Clips)
+            if event.clips.count > 1 {
+                HStack(spacing: 6) {
+                    Button {
+                        manager.goToPreviousClip()
+                    } label: {
+                        Image(systemName: "backward.frame.fill")
+                    }
+                    .disabled(manager.currentClipIndex == 0)
+
+                    Text("Clip \(manager.currentClipIndex + 1) / \(manager.totalClips)")
+                        .font(.caption.monospacedDigit())
+
+                    Button {
+                        manager.advanceToNextClip()
+                    } label: {
+                        Image(systemName: "forward.frame.fill")
+                    }
+                    .disabled(manager.currentClipIndex == manager.totalClips - 1)
+                }
+                .buttonStyle(.borderless)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(Color(NSColor.windowBackgroundColor))
+    }
+
+    // MARK: Steuerleiste
+
+    var controlBar: some View {
+        HStack(spacing: 10) {
+            Button {
+                manager.togglePlayback()
+            } label: {
+                Image(systemName: manager.isPlaying ? "pause.circle.fill" : "play.circle.fill")
+                    .font(.title)
+            }
+            .buttonStyle(.borderless)
+
+            Text(timeStr(manager.currentTime))
+                .font(.caption.monospacedDigit())
+                .frame(width: 42, alignment: .trailing)
+
+            Slider(
+                value: Binding(
+                    get: { manager.currentTime },
+                    set: { manager.currentTime = $0 }
+                ),
+                in: 0...max(manager.duration, 0.01)
+            ) { editing in
+                if !editing { manager.seekTo(time: manager.currentTime) }
+            }
+
+            Text(timeStr(manager.duration))
+                .font(.caption.monospacedDigit())
+                .frame(width: 42)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(Color(NSColor.windowBackgroundColor))
+    }
+
+    private func timeStr(_ s: Double) -> String {
+        let s = max(0, s)
+        return String(format: "%02d:%02d", Int(s) / 60, Int(s) % 60)
+    }
+}
+
+// MARK: - Kamera-Zelle
+
+struct CameraCell: View {
+    let player: AVPlayer?
+    let label: String
+
+    var body: some View {
+        ZStack(alignment: .bottomLeading) {
+            if let player = player {
+                PlayerView(player: player)
+            } else {
+                Color.black.overlay(
+                    VStack(spacing: 4) {
+                        Image(systemName: "video.slash.fill")
+                            .foregroundColor(Color.gray.opacity(0.6))
+                        Text("Kein Signal")
+                            .font(.caption2)
+                            .foregroundColor(Color.gray.opacity(0.6))
+                    }
+                )
+            }
+
+            Text(label)
+                .font(.caption2)
+                .foregroundColor(.white)
+                .padding(.horizontal, 5)
+                .padding(.vertical, 2)
+                .background(Color.black.opacity(0.55))
+                .cornerRadius(3)
+                .padding(5)
+        }
+    }
+}
+
+// MARK: - NSViewRepresentable
+
+struct PlayerView: NSViewRepresentable {
+    let player: AVPlayer
+
+    func makeNSView(context: Context) -> AVPlayerView {
+        let v = AVPlayerView()
+        v.player = player
+        v.controlsStyle = .none
+        v.videoGravity = .resizeAspect
+        return v
+    }
+
+    func updateNSView(_ v: AVPlayerView, context: Context) {
+        if v.player !== player { v.player = player }
+    }
 }
