@@ -61,6 +61,7 @@ Tests are in `TeslaViewerTests/TeslaViewerTests.swift` and cover `EventLoader`, 
 ## Notes
 
 - The app is **macOS-only**. Uses `NSOpenPanel`, `NSViewRepresentable`, `AVPlayerView`, and `Color(NSColor.windowBackgroundColor)`.
-- UI strings are in **German** (this is intentional — the app targets German-speaking users).
+- UI strings **and source code comments** are in **German** (this is intentional — the app targets German-speaking users). New UI text and comments should also be in German.
+- `Combine` is imported but only used implicitly via `ObservableObject`/`@Published`. Prefer async/await for new async work.
 - `Item.swift` (SwiftData scaffold) is unused and can be ignored.
 - Minimum window size is 1000×680 pt (enforced in `TeslaViewerApp`).

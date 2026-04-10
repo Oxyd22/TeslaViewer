@@ -48,10 +48,10 @@ struct TeslaViewerTests {
         #expect(events.first?.city == "Berlin")
         #expect(events.first?.reason == "sentry_aware_object_detection")
         #expect(events.first?.clips.count == 1)
-        #expect(events.first?.clips.first?.cameraURLs["front"] != nil)
-        #expect(events.first?.clips.first?.cameraURLs["back"] != nil)
-        #expect(events.first?.clips.first?.cameraURLs["left_pillar"] != nil)
-        #expect(events.first?.clips.first?.cameraURLs["right_pillar"] != nil)
+        #expect(await events.first?.clips.first?.cameraURLs["front"] != nil)
+        #expect(await events.first?.clips.first?.cameraURLs["back"] != nil)
+        #expect(await events.first?.clips.first?.cameraURLs["left_pillar"] != nil)
+        #expect(await events.first?.clips.first?.cameraURLs["right_pillar"] != nil)
     }
 
     @Test func testEventReasonMapping() throws {
