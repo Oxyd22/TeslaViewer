@@ -17,29 +17,38 @@ Use the Xcode MCP tools for all build/test operations:
 
 ## Architecture
 
-The entire app logic lives in a single file: **`TeslaViewer/ContentView.swift`**. No separate model files, services, or view files exist (aside from the unused `Item.swift` SwiftData scaffold from the project template).
+The app is split into focused files under `TeslaViewer/TeslaViewer/`:
+
+| Datei | Inhalt |
+|-------|--------|
+| `Models.swift` | `EventReason`, `SentryClip`, `SentryEvent` + Preview-Beispieldaten |
+| `EventLoader.swift` | `EventLoader` — Filesystem-Scanner und Parser |
+| `VideoPlayerManager.swift` | `VideoPlayerManager` — `@MainActor @Observable`, verwaltet alle AVPlayer |
+| `VideoGridView.swift` | `VideoGridView`, `CameraCell`, `PlayerView` (NSViewRepresentable) |
+| `ContentView.swift` | `ContentView`, `SidebarView`, `EventRowView`, `PlaceholderView` |
+| `TeslaViewerApp.swift` | App-Entry-Point, WindowGroup-Konfiguration |
 
 ### Data Flow
 
 ```
 TeslaViewerApp → ContentView → SidebarView + VideoGridView
                                               ↑
-                               VideoPlayerManager (ObservableObject)
+                               VideoPlayerManager (@Observable)
 ```
 
 ### Key Types
 
 - **`EventLoader`** (enum, static methods) — Scans the filesystem. Accepts a TeslaCam root folder, a SentryClips folder, or any subfolder. Parses event folders named `YYYY-MM-DD_HH-mm-ss`, reads `event.json` for metadata, and groups MP4 files by timestamp prefix into `SentryClip` objects.
 
-- **`SentryEvent`** — One trigger event (one folder). Contains metadata (`city`, `reason`, `thumbnailURL`) and an array of `SentryClip` objects sorted chronologically.
+- **`SentryEvent`** — One trigger event (one folder). All properties are `let` (immutable). Contains metadata (`city`, `reason`, `thumbnailURL`) and an array of `SentryClip` objects sorted chronologically.
 
-- **`SentryClip`** — One group of simultaneous MP4 files (one per camera). Camera names are the key in `cameraURLs: [String: URL]`.
+- **`SentryClip`** — One group of simultaneous MP4 files (one per camera). All properties are `let`. Camera names are the key in `cameraURLs: [String: URL]`.
 
 - **`EventReason`** — Wraps the raw reason string from `event.json` and maps it to localized German display strings and SF Symbols.
 
-- **`VideoPlayerManager`** (ObservableObject) — Owns all `AVPlayer` instances for the current clip. Tracks time via a periodic observer on the "front" camera player (fallback: first available). Handles clip navigation, seek, and play/pause across all cameras simultaneously.
+- **`VideoPlayerManager`** (`@MainActor @Observable`) — Owns all `AVPlayer` instances for the current clip. Tracks time via a periodic observer on the "front" camera player (fallback: first available). Handles clip navigation, seek, and play/pause across all cameras simultaneously.
 
-- **`VideoGridView`** — Detail view. Renders a fixed 3×2 camera layout (`left_repeater/front/right_repeater` top row; `left_pillar/back/right_pillar` bottom row). Uses `GeometryReader` to fill available space.
+- **`VideoGridView`** — Detail view. Renders a fixed 3×2 camera layout using SwiftUI `Grid`. Supports keyboard shortcuts (Space, arrow keys).
 
 - **`CameraCell`** — Single camera tile. Shows `PlayerView` if a player exists, otherwise shows a "no signal" placeholder.
 
@@ -62,6 +71,7 @@ Tests are in `TeslaViewerTests/TeslaViewerTests.swift` and cover `EventLoader`, 
 
 - The app is **macOS-only**. Uses `NSOpenPanel`, `NSViewRepresentable`, `AVPlayerView`, and `Color(NSColor.windowBackgroundColor)`.
 - UI strings **and source code comments** are in **German** (this is intentional — the app targets German-speaking users). New UI text and comments should also be in German.
-- `Combine` is imported but only used implicitly via `ObservableObject`/`@Published`. Prefer async/await for new async work.
+- Uses `@Observable` (not `ObservableObject`/Combine). Prefer async/await for new async work.
 - `Item.swift` (SwiftData scaffold) is unused and can be ignored.
 - Minimum window size is 1000×680 pt (enforced in `TeslaViewerApp`).
+- Preview-Beispieldaten sind in `Models.swift` als `SentryEvent.preview` / `.previewList` verfügbar.

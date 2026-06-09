@@ -93,7 +93,7 @@ struct TeslaViewerTests {
         }
     }
 
-    @Test func testVideoPlayerManager() throws {
+    @Test @MainActor func testVideoPlayerManager() throws {
         // Test basic VideoPlayerManager initialization
         let manager = VideoPlayerManager()
         #expect(manager.totalClips == 0)
