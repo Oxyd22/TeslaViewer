@@ -7,14 +7,28 @@
 
 import SwiftUI
 
+// MARK: - Fokussierte Aktion (für die Menüleiste)
+
+private struct OpenFolderActionKey: FocusedValueKey {
+    typealias Value = () -> Void
+}
+
+extension FocusedValues {
+    var openFolderAction: (() -> Void)? {
+        get { self[OpenFolderActionKey.self] }
+        set { self[OpenFolderActionKey.self] = newValue }
+    }
+}
+
 // MARK: - Haupt-View
 
 struct ContentView: View {
+    @State private var folderStore = FolderStore()
     @State private var events: [SentryEvent] = []
     @State private var selectedEvent: SentryEvent?
     @State private var isLoading = false
     @State private var hasLoaded = false
-    @State private var securityScopedURL: URL?
+    @State private var skippedEncrypted = false
 
     var body: some View {
         NavigationSplitView {
@@ -23,9 +37,9 @@ struct ContentView: View {
                 selectedEvent: $selectedEvent,
                 isLoading: isLoading,
                 hasLoaded: hasLoaded,
-                onSelectFolder: loadFolder
+                skippedEncrypted: skippedEncrypted
             )
-            .frame(minWidth: 240)
+            .frame(minWidth: 260)
         } detail: {
             if let event = selectedEvent {
                 VideoGridView(event: event)
@@ -34,36 +48,53 @@ struct ContentView: View {
                 PlaceholderView(hasEvents: !events.isEmpty)
             }
         }
-        .onDisappear {
-            securityScopedURL?.stopAccessingSecurityScopedResource()
+        .toolbar {
+            ToolbarItem {
+                Button {
+                    loadFolder()
+                } label: {
+                    Label("Ordner öffnen", systemImage: "folder.badge.plus")
+                }
+            }
+            ToolbarItem {
+                Button {
+                    revealSelectedInFinder()
+                } label: {
+                    Label("Im Finder zeigen", systemImage: "folder")
+                }
+                .disabled(selectedEvent == nil)
+            }
         }
+        .task {
+            if let url = folderStore.currentURL {
+                await load(from: url)
+            }
+        }
+        .focusedSceneValue(\.openFolderAction, loadFolder)
     }
 
     private func loadFolder() {
-        let panel = NSOpenPanel()
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        panel.message = "TeslaCam-Ordner oder SentryClips-Ordner auswählen"
-        panel.prompt = "Öffnen"
-        guard panel.runModal() == .OK, let url = panel.url else { return }
+        guard let url = folderStore.chooseFolder() else { return }
+        Task { await load(from: url) }
+    }
 
-        securityScopedURL?.stopAccessingSecurityScopedResource()
-        let granted = url.startAccessingSecurityScopedResource()
-        securityScopedURL = granted ? url : nil
+    private func revealSelectedInFinder() {
+        guard let event = selectedEvent else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([event.folderURL])
+    }
+
+    private func load(from url: URL) async {
         isLoading = true
         hasLoaded = false
         events = []
         selectedEvent = nil
 
-        Task.detached(priority: .userInitiated) {
-            let loaded = EventLoader.loadEvents(from: url)
-            await MainActor.run {
-                self.events = loaded
-                self.selectedEvent = loaded.first
-                self.isLoading = false
-                self.hasLoaded = true
-            }
-        }
+        let result = await EventLoader.scan(root: url)
+        events = result.events
+        skippedEncrypted = result.skippedEncrypted
+        selectedEvent = result.events.first
+        isLoading = false
+        hasLoaded = true
     }
 }
 
@@ -74,51 +105,68 @@ struct SidebarView: View {
     @Binding var selectedEvent: SentryEvent?
     let isLoading: Bool
     let hasLoaded: Bool
-    let onSelectFolder: () -> Void
+    let skippedEncrypted: Bool
+
+    private static let sourceOrder: [ClipSource] = [.sentry, .saved]
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Button(action: onSelectFolder) {
-                    Label("Öffnen", systemImage: "folder.badge.plus")
-                }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.small)
-
-                Spacer()
-
-                if !events.isEmpty {
-                    Text("\(events.count) Ereignisse")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
-            }
-            .padding(10)
-
-            Divider()
-
+        Group {
             if isLoading {
-                Spacer()
                 ProgressView("Lade Ereignisse…")
-                Spacer()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if events.isEmpty {
-                Spacer()
-                VStack(spacing: 10) {
-                    Image(systemName: hasLoaded ? "questionmark.folder.fill" : "car.fill")
-                        .font(.largeTitle)
-                        .foregroundStyle(.secondary)
-                    Text(hasLoaded ? "Keine Ereignisse gefunden" : "Kein Ordner geladen")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
+                ContentUnavailableView(
+                    hasLoaded ? "Keine Ereignisse gefunden" : "Kein Ordner geladen",
+                    systemImage: hasLoaded ? "questionmark.folder.fill" : "car.fill",
+                    description: hasLoaded ? nil : Text("Öffne einen TeslaCam-Ordner, um Ereignisse zu sehen.")
+                )
             } else {
-                List(events, selection: $selectedEvent) { event in
-                    EventRowView(event: event).tag(event)
+                List(selection: $selectedEvent) {
+                    ForEach(Self.sourceOrder, id: \.self) { source in
+                        let sourceEvents = events.filter { $0.source == source }
+                        if !sourceEvents.isEmpty {
+                            Section(source.displayName) {
+                                ForEach(Self.groupedByDay(sourceEvents)) { group in
+                                    Text(group.day)
+                                        .font(.caption).fontWeight(.semibold)
+                                        .foregroundStyle(.secondary)
+                                    ForEach(group.events) { event in
+                                        EventRowView(event: event).tag(event)
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if skippedEncrypted {
+                        Text("Verschlüsselte Clips werden übersprungen.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .listRowSeparator(.hidden)
+                    }
                 }
                 .listStyle(.sidebar)
             }
         }
+    }
+
+    private struct DayGroup: Identifiable {
+        let day: String
+        let events: [SentryEvent]
+        var id: String { day }
+    }
+
+    private static func groupedByDay(_ events: [SentryEvent]) -> [DayGroup] {
+        var groups: [DayGroup] = []
+        for event in events {
+            let day = event.displayDay
+            if let last = groups.last, last.day == day {
+                groups[groups.count - 1] = DayGroup(day: day, events: last.events + [event])
+            } else {
+                groups.append(DayGroup(day: day, events: [event]))
+            }
+        }
+        return groups
     }
 }
 
@@ -131,8 +179,8 @@ struct EventRowView: View {
     var body: some View {
         HStack(spacing: 8) {
             Group {
-                if let img = thumbnail {
-                    Image(nsImage: img)
+                if let thumbnail {
+                    Image(nsImage: thumbnail)
                         .resizable()
                         .aspectRatio(contentMode: .fill)
                         .frame(width: 62, height: 40)
@@ -149,13 +197,13 @@ struct EventRowView: View {
             }
             .task(id: event.thumbnailURL) {
                 guard let url = event.thumbnailURL else { return }
-                thumbnail = await Task.detached {
-                    NSImage(contentsOf: url)
-                }.value
+                let data = try? await Task.detached { try Data(contentsOf: url) }.value
+                guard let data else { return }
+                thumbnail = NSImage(data: data)
             }
 
             VStack(alignment: .leading, spacing: 2) {
-                Text(event.displayDate)
+                Text(event.displayTime)
                     .font(.caption).fontWeight(.semibold)
                     .lineLimit(1)
 
@@ -167,7 +215,7 @@ struct EventRowView: View {
 
                 Label(event.reasonInfo.display, systemImage: event.reasonInfo.systemIcon)
                     .font(.caption2)
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(event.reasonInfo.severityColor)
                     .lineLimit(1)
 
                 Text("\(event.clips.count) Clip\(event.clips.count == 1 ? "" : "s")")
@@ -176,6 +224,7 @@ struct EventRowView: View {
             }
         }
         .padding(.vertical, 3)
+        .accessibilityElement(children: .combine)
     }
 }
 
@@ -185,14 +234,10 @@ struct PlaceholderView: View {
     let hasEvents: Bool
 
     var body: some View {
-        VStack(spacing: 16) {
-            Image(systemName: hasEvents ? "car.rear.fill" : "folder.badge.plus")
-                .font(.system(size: 64))
-                .foregroundStyle(.secondary)
-            Text(hasEvents ? "Ereignis aus der Liste wählen" : "TeslaCam-Ordner öffnen")
-                .font(.title2)
-                .foregroundStyle(.secondary)
-        }
+        ContentUnavailableView(
+            hasEvents ? "Ereignis aus der Liste wählen" : "TeslaCam-Ordner öffnen",
+            systemImage: hasEvents ? "car.rear.fill" : "folder.badge.plus"
+        )
     }
 }
 
@@ -204,7 +249,7 @@ struct PlaceholderView: View {
         selectedEvent: .constant(nil),
         isLoading: false,
         hasLoaded: true,
-        onSelectFolder: {}
+        skippedEncrypted: true
     )
     .frame(width: 280, height: 500)
 }
@@ -215,7 +260,7 @@ struct PlaceholderView: View {
         selectedEvent: .constant(nil),
         isLoading: false,
         hasLoaded: false,
-        onSelectFolder: {}
+        skippedEncrypted: false
     )
     .frame(width: 280, height: 400)
 }
@@ -226,7 +271,7 @@ struct PlaceholderView: View {
         selectedEvent: .constant(nil),
         isLoading: false,
         hasLoaded: true,
-        onSelectFolder: {}
+        skippedEncrypted: false
     )
     .frame(width: 280, height: 400)
 }

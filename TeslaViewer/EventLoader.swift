@@ -11,40 +11,90 @@ enum EventLoader {
     /// Länge des Timestamp-Prefix "YYYY-MM-DD_HH-mm-ss" in Tesla-Dateinamen
     private nonisolated static let timestampPrefixLength = 19
 
-    nonisolated static let dateFormatter: DateFormatter = {
-        let f = DateFormatter()
-        f.dateFormat = "yyyy-MM-dd_HH-mm-ss"
-        f.locale = Locale(identifier: "en_US_POSIX")
-        return f
-    }()
+    private nonisolated static let filenameFormat: Date.FormatString =
+        "\(year: .defaultDigits)-\(month: .twoDigits)-\(day: .twoDigits)_\(hour: .twoDigits(clock: .twentyFourHour, hourCycle: .zeroBased))-\(minute: .twoDigits)-\(second: .twoDigits)"
 
-    nonisolated static func loadEvents(from rootURL: URL) -> [SentryEvent] {
-        // Unterstützt: TeslaCam-Root, direkter SentryClips-Ordner, oder Unterordner
-        var searchURL = rootURL
-        if rootURL.lastPathComponent != "SentryClips" {
-            let candidate = rootURL.appendingPathComponent("SentryClips")
-            if FileManager.default.fileExists(atPath: candidate.path) {
-                searchURL = candidate
-            }
+    private nonisolated static let jsonTimestampFormat: Date.FormatString =
+        "\(year: .defaultDigits)-\(month: .twoDigits)-\(day: .twoDigits)T\(hour: .twoDigits(clock: .twentyFourHour, hourCycle: .zeroBased)):\(minute: .twoDigits):\(second: .twoDigits)"
+
+    nonisolated struct ScanResult: Sendable {
+        let events: [SentryEvent]
+        /// Ob ein "EncryptedClips"-Ordner gefunden und übersprungen wurde.
+        let skippedEncrypted: Bool
+    }
+
+    /// Scannt eine TeslaCam-Ordnerstruktur. Unterstützt: TeslaCam-Root (mit SentryClips
+    /// und/oder SavedClips), einen direkten SentryClips-/SavedClips-Ordner, einen einzelnen
+    /// Ereignisordner, oder einen Ordner mit Ereignisunterordnern.
+    @concurrent
+    nonisolated static func scan(root rootURL: URL) async -> ScanResult {
+        let fm = FileManager.default
+        let name = rootURL.lastPathComponent
+
+        if name == "SentryClips" {
+            return ScanResult(events: events(in: rootURL, source: .sentry), skippedEncrypted: false)
+        }
+        if name == "SavedClips" {
+            return ScanResult(events: events(in: rootURL, source: .saved), skippedEncrypted: false)
+        }
+        if let date = parseFolderDate(name) {
+            let event = parseEvent(at: rootURL, eventTimestamp: date, source: .sentry)
+            return ScanResult(events: event.map { [$0] } ?? [], skippedEncrypted: false)
         }
 
+        var sourceRoots: [(URL, ClipSource)] = []
+        let sentryDir = rootURL.appendingPathComponent("SentryClips")
+        if fm.fileExists(atPath: sentryDir.path) {
+            sourceRoots.append((sentryDir, .sentry))
+        }
+        let savedDir = rootURL.appendingPathComponent("SavedClips")
+        if fm.fileExists(atPath: savedDir.path) {
+            sourceRoots.append((savedDir, .saved))
+        }
+        let skippedEncrypted = fm.fileExists(
+            atPath: rootURL.appendingPathComponent("EncryptedClips").path
+        )
+
+        if sourceRoots.isEmpty {
+            // Kein bekannter Unterordner: den Ordner selbst nach Ereignisunterordnern durchsuchen.
+            sourceRoots.append((rootURL, .sentry))
+        }
+
+        var allEvents: [SentryEvent] = []
+        for (dir, source) in sourceRoots {
+            allEvents.append(contentsOf: events(in: dir, source: source))
+        }
+        allEvents.sort { $0.eventTimestamp > $1.eventTimestamp }
+        return ScanResult(events: allEvents, skippedEncrypted: skippedEncrypted)
+    }
+
+    private nonisolated static func events(in directory: URL, source: ClipSource) -> [SentryEvent] {
         let folders = (try? FileManager.default.contentsOfDirectory(
-            at: searchURL,
+            at: directory,
             includingPropertiesForKeys: [.isDirectoryKey],
             options: .skipsHiddenFiles
         ))?.filter { $0.hasDirectoryPath } ?? []
 
-        return folders
-            .compactMap { parseEvent(at: $0) }
-            .sorted { $0.eventTimestamp > $1.eventTimestamp }
+        return folders.compactMap { folder in
+            guard let date = parseFolderDate(folder.lastPathComponent) else { return nil }
+            return parseEvent(at: folder, eventTimestamp: date, source: source)
+        }
     }
 
-    nonisolated static func parseEvent(at folderURL: URL) -> SentryEvent? {
-        let name = folderURL.lastPathComponent
-        guard let date = dateFormatter.date(from: name) else { return nil }
+    private nonisolated static func parseFolderDate(_ name: String) -> Date? {
+        try? Date(name, strategy: .fixed(format: filenameFormat, timeZone: .current))
+    }
 
-        // event.json parsen
-        struct Metadata: Decodable { var city: String?; var reason: String? }
+    private nonisolated static func parseEvent(
+        at folderURL: URL, eventTimestamp: Date, source: ClipSource
+    ) -> SentryEvent? {
+        struct Metadata: Decodable {
+            var timestamp: String?
+            var city: String?
+            var street: String?
+            var reason: String?
+        }
+
         let jsonURL = folderURL.appendingPathComponent("event.json")
         let meta: Metadata? = if let data = try? Data(contentsOf: jsonURL) {
             try? JSONDecoder().decode(Metadata.self, from: data)
@@ -52,7 +102,10 @@ enum EventLoader {
             nil
         }
 
-        // Thumbnail
+        let triggerTimestamp = meta?.timestamp.flatMap {
+            try? Date($0, strategy: .fixed(format: jsonTimestampFormat, timeZone: .current))
+        }
+
         let thumb = folderURL.appendingPathComponent("thumb.png")
         let thumbnailURL = FileManager.default.fileExists(atPath: thumb.path) ? thumb : nil
 
@@ -72,7 +125,7 @@ enum EventLoader {
         }
 
         let clips = groups.compactMap { prefix, urls -> SentryClip? in
-            guard let clipDate = dateFormatter.date(from: prefix) else { return nil }
+            guard let clipDate = parseFolderDate(prefix) else { return nil }
             var cameraURLs: [String: URL] = [:]
             for url in urls {
                 let stem = url.deletingPathExtension().lastPathComponent
@@ -85,12 +138,16 @@ enum EventLoader {
             return SentryClip(clipTimestamp: clipDate, cameraURLs: cameraURLs)
         }.sorted { $0.clipTimestamp < $1.clipTimestamp }
 
+        let street = meta?.street
         return SentryEvent(
             folderURL: folderURL,
-            eventTimestamp: date,
+            eventTimestamp: eventTimestamp,
+            triggerTimestamp: triggerTimestamp,
             city: meta?.city,
+            street: (street?.isEmpty ?? true) ? nil : street,
             reason: meta?.reason,
             thumbnailURL: thumbnailURL,
+            source: source,
             clips: clips
         )
     }

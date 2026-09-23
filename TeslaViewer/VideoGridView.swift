@@ -2,11 +2,34 @@
 //  VideoGridView.swift
 //  TeslaViewer
 //
-//  Zeigt alle 6 Kamera-Feeds in einem 3x2 Grid mit Steuerleiste.
+//  Zeigt alle 6 Kamera-Feeds in einem 3x2 Grid mit einer durchgehenden
+//  Zeitleiste über das gesamte Ereignis.
 //
 
 import SwiftUI
-import AVKit
+import AVFoundation
+
+// MARK: - Fokussierte Wiedergabe-Aktionen (für die Menüleiste)
+
+struct PlaybackActions {
+    var togglePlayback: () -> Void
+    var stepBackward: () -> Void
+    var stepForward: () -> Void
+    var jumpToTrigger: (() -> Void)?
+    var exitFocus: (() -> Void)?
+    var revealInFinder: () -> Void
+}
+
+private struct PlaybackActionsKey: FocusedValueKey {
+    typealias Value = PlaybackActions
+}
+
+extension FocusedValues {
+    var playbackActions: PlaybackActions? {
+        get { self[PlaybackActionsKey.self] }
+        set { self[PlaybackActionsKey.self] = newValue }
+    }
+}
 
 // MARK: - Video-Grid
 
@@ -14,95 +37,91 @@ struct VideoGridView: View {
     let event: SentryEvent
     @State private var manager = VideoPlayerManager()
     @State private var zoomedCamera: String?
+    @Namespace private var cameraNamespace
 
     // Kamera-Layout: 3 Spalten x 2 Zeilen
-    // [left_repeater] [  front  ] [right_repeater]
-    // [left_pillar  ] [  back   ] [right_pillar  ]
+    // [left_pillar  ] [  front  ] [right_pillar  ]  ← nach vorn gerichtet
+    // [left_repeater] [  back   ] [right_repeater]  ← nach hinten gerichtet
     private static let layout: [[String]] = [
-        ["left_repeater", "front",  "right_repeater"],
-        ["left_pillar",   "back",   "right_pillar"]
+        ["left_pillar",   "front", "right_pillar"],
+        ["left_repeater",  "back", "right_repeater"]
     ]
 
     private static let cameraLabels: [String: String] = [
         "front":           "Front",
         "back":            "Hinten",
-        "left_repeater":   "Links",
-        "right_repeater":  "Rechts",
-        "left_pillar":     "Links hinten",
-        "right_pillar":    "Rechts hinten"
+        "left_pillar":     "Links vorne",
+        "right_pillar":    "Rechts vorne",
+        "left_repeater":   "Links hinten",
+        "right_repeater":  "Rechts hinten"
     ]
 
     var body: some View {
-        VStack(spacing: 0) {
-            headerBar
-            Divider()
+        content
+            .safeAreaInset(edge: .top) { headerBar }
+            .safeAreaInset(edge: .bottom) {
+                if !event.clips.isEmpty { controlBar }
+            }
+            .background(Color.black)
+            .task(id: event.id) {
+                await manager.load(event)
+            }
+            .onDisappear { manager.tearDown() }
+            .focusedSceneValue(\.playbackActions, playbackActions)
+    }
 
-            if event.clips.isEmpty {
-                Spacer()
-                VStack(spacing: 8) {
-                    Image(systemName: "exclamationmark.triangle")
-                        .font(.largeTitle)
-                        .foregroundStyle(.secondary)
-                    Text("Keine Videodateien gefunden")
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-            } else if let zoomed = zoomedCamera {
-                // Einzelkamera-Zoom
-                CameraCell(
-                    player: manager.players[zoomed],
-                    label: Self.cameraLabels[zoomed] ?? zoomed
-                )
+    @ViewBuilder
+    private var content: some View {
+        if event.clips.isEmpty {
+            ContentUnavailableView(
+                "Keine Videodateien gefunden",
+                systemImage: "exclamationmark.triangle",
+                description: Text("Für dieses Ereignis wurden keine Kameraaufnahmen gefunden.")
+            )
+        } else if let zoomed = zoomedCamera {
+            CameraCell(player: manager.players[zoomed], label: Self.cameraLabels[zoomed] ?? zoomed)
+                .matchedGeometryEffect(id: zoomed, in: cameraNamespace)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .onTapGesture(count: 2) {
-                    withAnimation(.easeInOut(duration: 0.25)) { zoomedCamera = nil }
-                }
-                .background(Color.black)
-                .transition(.opacity)
-            } else {
-                // 3x2 Kamera-Grid
-                Grid(horizontalSpacing: 2, verticalSpacing: 2) {
-                    ForEach(Self.layout, id: \.self) { row in
-                        GridRow {
-                            ForEach(row, id: \.self) { camera in
-                                CameraCell(
-                                    player: manager.players[camera],
-                                    label: Self.cameraLabels[camera] ?? camera
-                                )
+                .contentShape(Rectangle())
+                .onTapGesture { exitFocus() }
+                .accessibilityAddTraits(.isButton)
+                .accessibilityHint("Tippen, um zur Rasteransicht zurückzukehren.")
+        } else {
+            Grid(horizontalSpacing: 2, verticalSpacing: 2) {
+                ForEach(Self.layout, id: \.self) { row in
+                    GridRow {
+                        ForEach(row, id: \.self) { camera in
+                            CameraCell(player: manager.players[camera], label: Self.cameraLabels[camera] ?? camera)
+                                .matchedGeometryEffect(id: camera, in: cameraNamespace)
                                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-                                .onTapGesture(count: 2) {
-                                    withAnimation(.easeInOut(duration: 0.25)) { zoomedCamera = camera }
-                                }
-                            }
+                                .contentShape(Rectangle())
+                                .onTapGesture { focus(on: camera) }
+                                .accessibilityAddTraits(.isButton)
+                                .accessibilityHint("Tippen, um diese Kamera zu vergrößern.")
                         }
                     }
                 }
-                .background(Color.black)
-                .transition(.opacity)
             }
+        }
+    }
 
-            Divider()
-            controlBar
-        }
-        .focusable()
-        .onKeyPress(.space) {
-            manager.togglePlayback()
-            return .handled
-        }
-        .onKeyPress(.rightArrow) {
-            manager.advanceToNextClip()
-            return .handled
-        }
-        .onKeyPress(.leftArrow) {
-            manager.goToPreviousClip()
-            return .handled
-        }
-        .onKeyPress(.escape) {
-            guard zoomedCamera != nil else { return .ignored }
-            withAnimation(.easeInOut(duration: 0.25)) { zoomedCamera = nil }
-            return .handled
-        }
-        .onAppear { manager.setup(clips: event.clips) }
+    private func focus(on camera: String) {
+        withAnimation(.easeInOut(duration: 0.25)) { zoomedCamera = camera }
+    }
+
+    private func exitFocus() {
+        withAnimation(.easeInOut(duration: 0.25)) { zoomedCamera = nil }
+    }
+
+    private var playbackActions: PlaybackActions {
+        PlaybackActions(
+            togglePlayback: { manager.togglePlayback() },
+            stepBackward: { manager.step(by: -1) },
+            stepForward: { manager.step(by: 1) },
+            jumpToTrigger: manager.triggerOffset != nil ? { manager.jumpToTrigger() } : nil,
+            exitFocus: zoomedCamera != nil ? { exitFocus() } : nil,
+            revealInFinder: { NSWorkspace.shared.activateFileViewerSelecting([event.folderURL]) }
+        )
     }
 
     // MARK: Header
@@ -112,81 +131,162 @@ struct VideoGridView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(event.displayDate)
                     .font(.subheadline).fontWeight(.semibold)
-                if let city = event.city {
-                    Text(city)
+                let location = [event.street, event.city].compactMap { $0 }.joined(separator: ", ")
+                if !location.isEmpty {
+                    Text(location)
                         .font(.caption).foregroundStyle(.secondary)
                 }
             }
 
             Spacer()
 
-            // Auslöse-Badge
             Label(event.reasonInfo.display, systemImage: event.reasonInfo.systemIcon)
                 .font(.caption)
                 .padding(.horizontal, 8).padding(.vertical, 4)
-                .background(Color.orange.opacity(0.15))
-                .foregroundStyle(.orange)
+                .background(event.reasonInfo.severityColor.opacity(0.15))
+                .foregroundStyle(event.reasonInfo.severityColor)
                 .clipShape(RoundedRectangle(cornerRadius: 6))
-
-            // Clip-Navigation (nur bei mehreren Clips)
-            if event.clips.count > 1 {
-                HStack(spacing: 6) {
-                    Button {
-                        manager.goToPreviousClip()
-                    } label: {
-                        Image(systemName: "backward.frame.fill")
-                    }
-                    .disabled(manager.currentClipIndex == 0)
-
-                    Text("Clip \(manager.currentClipIndex + 1) / \(manager.totalClips)")
-                        .font(.caption.monospacedDigit())
-
-                    Button {
-                        manager.advanceToNextClip()
-                    } label: {
-                        Image(systemName: "forward.frame.fill")
-                    }
-                    .disabled(manager.currentClipIndex == manager.totalClips - 1)
-                }
-                .buttonStyle(.borderless)
-            }
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
-        .background(Color(NSColor.windowBackgroundColor))
+        .background(.bar)
     }
 
     // MARK: Steuerleiste
 
     private var controlBar: some View {
-        HStack(spacing: 10) {
-            Button {
-                manager.togglePlayback()
-            } label: {
-                Image(systemName: manager.isPlaying ? "pause.circle.fill" : "play.circle.fill")
-                    .font(.title)
+        GlassEffectContainer {
+            HStack(spacing: 14) {
+                Button {
+                    manager.togglePlayback()
+                } label: {
+                    Image(systemName: manager.isPlaying ? "pause.fill" : "play.fill")
+                        .font(.title3)
+                        .frame(width: 18)
+                }
+                .buttonStyle(.plain)
+
+                Text(timeStr(manager.currentTime))
+                    .font(.caption.monospacedDigit())
+                    .frame(width: 42, alignment: .trailing)
+
+                EventTimelineView(
+                    duration: manager.duration,
+                    clipBoundaries: manager.clipBoundaries,
+                    triggerOffset: manager.triggerOffset,
+                    severityColor: event.reasonInfo.severityColor,
+                    currentTime: manager.currentTime,
+                    onScrub: { time in
+                        manager.isSeeking = true
+                        manager.seek(to: time, precise: false)
+                    },
+                    onCommit: { time in
+                        manager.seek(to: time, precise: true)
+                        manager.isSeeking = false
+                    }
+                )
+
+                Text(timeStr(manager.duration))
+                    .font(.caption.monospacedDigit())
+                    .frame(width: 42)
+
+                if manager.triggerOffset != nil {
+                    Button {
+                        manager.jumpToTrigger()
+                    } label: {
+                        Image(systemName: "bolt.fill")
+                    }
+                    .buttonStyle(.plain)
+                    .help("Zum Ereignis springen")
+                }
             }
-            .buttonStyle(.borderless)
-
-            Text(timeStr(manager.currentTime))
-                .font(.caption.monospacedDigit())
-                .frame(width: 42, alignment: .trailing)
-
-            Slider(
-                value: $manager.currentTime,
-                in: 0...max(manager.duration, 0.01)
-            ) { editing in
-                manager.isSeeking = editing
-                if !editing { manager.seekTo(time: manager.currentTime) }
-            }
-
-            Text(timeStr(manager.duration))
-                .font(.caption.monospacedDigit())
-                .frame(width: 42)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 10)
+            .glassEffect(.clear.interactive(), in: .rect(cornerRadius: 20))
         }
         .padding(.horizontal, 14)
-        .padding(.vertical, 10)
-        .background(Color(NSColor.windowBackgroundColor))
+        .padding(.bottom, 10)
+    }
+
+    private func timeStr(_ seconds: Double) -> String {
+        let clamped = Int(max(0, seconds))
+        return String(format: "%02d:%02d", clamped / 60, clamped % 60)
+    }
+}
+
+// MARK: - Zeitleiste
+
+/// Eine durchgehende Zeitleiste über das gesamte Ereignis mit Teilstrichen an den
+/// Clipgrenzen und einer Markierung am tatsächlichen Auslöse-Zeitpunkt.
+private struct EventTimelineView: View {
+    let duration: Double
+    let clipBoundaries: [Double]
+    let triggerOffset: Double?
+    let severityColor: Color
+    let currentTime: Double
+    let onScrub: (Double) -> Void
+    let onCommit: (Double) -> Void
+
+    var body: some View {
+        GeometryReader { geometry in
+            let width = geometry.size.width
+            ZStack(alignment: .leading) {
+                Capsule()
+                    .fill(.white.opacity(0.25))
+                    .frame(height: 4)
+
+                Capsule()
+                    .fill(.white)
+                    .frame(width: xPosition(for: currentTime, in: width), height: 4)
+
+                ForEach(clipBoundaries, id: \.self) { boundary in
+                    Rectangle()
+                        .fill(.white.opacity(0.5))
+                        .frame(width: 1, height: 8)
+                        .offset(x: xPosition(for: boundary, in: width))
+                }
+
+                if let triggerOffset {
+                    Image(systemName: "bolt.fill")
+                        .font(.system(size: 9))
+                        .foregroundStyle(severityColor)
+                        .offset(x: xPosition(for: triggerOffset, in: width) - 4, y: -10)
+                }
+
+                Circle()
+                    .fill(.white)
+                    .frame(width: 12, height: 12)
+                    .offset(x: xPosition(for: currentTime, in: width) - 6)
+            }
+            .frame(height: 20)
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { value in onScrub(time(forX: value.location.x, in: width)) }
+                    .onEnded { value in onCommit(time(forX: value.location.x, in: width)) }
+            )
+        }
+        .frame(height: 20)
+        .accessibilityElement()
+        .accessibilityLabel("Zeitleiste")
+        .accessibilityValue(timeStr(currentTime))
+        .accessibilityAdjustableAction { direction in
+            switch direction {
+            case .increment: onCommit(min(currentTime + 5, duration))
+            case .decrement: onCommit(max(currentTime - 5, 0))
+            @unknown default: break
+            }
+        }
+    }
+
+    private func xPosition(for time: Double, in width: Double) -> Double {
+        guard duration > 0 else { return 0 }
+        return (time / duration) * width
+    }
+
+    private func time(forX x: Double, in width: Double) -> Double {
+        guard width > 0 else { return 0 }
+        return max(0, min(duration, (x / width) * duration))
     }
 
     private func timeStr(_ seconds: Double) -> String {
@@ -231,19 +331,36 @@ struct CameraCell: View {
 
 // MARK: - NSViewRepresentable
 
+/// Zeigt einen `AVPlayer` über eine reine `AVPlayerLayer` an, statt über die schwerere
+/// `AVPlayerView`-Wiedergabe-UI von AVKit, die bei sechs parallelen Kacheln unnötig Last erzeugt.
 struct PlayerView: NSViewRepresentable {
     let player: AVPlayer
 
-    func makeNSView(context: Context) -> AVPlayerView {
-        let v = AVPlayerView()
-        v.player = player
-        v.controlsStyle = .none
-        v.videoGravity = .resizeAspect
-        return v
+    func makeNSView(context: Context) -> PlayerLayerView {
+        let view = PlayerLayerView()
+        view.playerLayer.player = player
+        return view
     }
 
-    func updateNSView(_ v: AVPlayerView, context: Context) {
-        if v.player !== player { v.player = player }
+    func updateNSView(_ view: PlayerLayerView, context: Context) {
+        if view.playerLayer.player !== player {
+            view.playerLayer.player = player
+        }
+    }
+}
+
+final class PlayerLayerView: NSView {
+    let playerLayer = AVPlayerLayer()
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        playerLayer.videoGravity = .resizeAspect
+        layer = playerLayer
+        wantsLayer = true
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) wird nicht unterstützt")
     }
 }
 
