@@ -16,6 +16,22 @@ Eine schlanke macOS-App zum Ansehen von Tesla Dashcam- und Sentry-Mode-Aufnahmen
 - macOS 27 oder neuer
 - Xcode 27 oder neuer
 
+## Installation
+
+TeslaViewer wird ohne Apple Developer Program vertrieben, ist also **nicht notarisiert**. macOS blockiert deshalb beim ersten Start mit „Apple kann nicht bestätigen, dass diese App frei von Malware ist" — das ist normal für kostenlose, nicht im App Store vertriebene Apps und kein Zeichen eines Problems.
+
+So startest du die App trotzdem:
+
+1. Lade `TeslaViewer.zip` herunter und entpacke es
+2. **Rechtsklick** (oder ctrl+Klick) auf `TeslaViewer.app` → **Öffnen**
+3. Im Dialog erneut **Öffnen** bestätigen
+
+Das ist nur beim allerersten Start nötig. Alternativ in System­einstellungen → Datenschutz & Sicherheit ganz unten „Trotzdem öffnen" wählen, oder im Terminal:
+
+```
+xattr -cr /Pfad/zu/TeslaViewer.app
+```
+
 ## Verwendung
 
 1. App starten
