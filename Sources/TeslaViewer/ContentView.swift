@@ -10,16 +10,29 @@ import SwiftUI
 // MARK: - Haupt-View
 
 struct ContentView: View {
-    @State private var events: [SentryEvent] = []
+    @State private var allEvents: [SentryEvent] = []
+    @State private var source: ClipSource = .sentry
     @State private var selectedEvent: SentryEvent?
     @State private var isLoading = false
     @State private var hasLoaded = false
     @State private var securityScopedURL: URL?
 
+    /// Ereignisse der aktuell gewählten Quelle.
+    private var events: [SentryEvent] {
+        allEvents.filter { $0.source == source }
+    }
+
+    /// Anzahl Ereignisse je Quelle (für den Umschalter).
+    private var sourceCounts: [ClipSource: Int] {
+        Dictionary(grouping: allEvents, by: \.source).mapValues(\.count)
+    }
+
     var body: some View {
         NavigationSplitView {
             SidebarView(
                 events: events,
+                source: $source,
+                sourceCounts: sourceCounts,
                 selectedEvent: $selectedEvent,
                 isLoading: isLoading,
                 hasLoaded: hasLoaded,
@@ -34,6 +47,10 @@ struct ContentView: View {
                 PlaceholderView(hasEvents: !events.isEmpty)
             }
         }
+        .onChange(of: source) {
+            // Beim Quellenwechsel das erste Ereignis der neuen Quelle wählen.
+            selectedEvent = events.first
+        }
         .onDisappear {
             securityScopedURL?.stopAccessingSecurityScopedResource()
         }
@@ -43,7 +60,7 @@ struct ContentView: View {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
-        panel.message = "TeslaCam-Ordner oder SentryClips-Ordner auswählen"
+        panel.message = "TeslaCam-Ordner, USB-Stick oder einen Clips-Ordner auswählen"
         panel.prompt = "Öffnen"
         guard panel.runModal() == .OK, let url = panel.url else { return }
 
@@ -52,14 +69,19 @@ struct ContentView: View {
         securityScopedURL = granted ? url : nil
         isLoading = true
         hasLoaded = false
-        events = []
+        allEvents = []
         selectedEvent = nil
 
         Task.detached(priority: .userInitiated) {
-            let loaded = EventLoader.loadEvents(from: url)
+            let loaded = EventLoader.loadAll(from: url)
             await MainActor.run {
-                self.events = loaded
-                self.selectedEvent = loaded.first
+                self.allEvents = loaded
+                // Erste Quelle mit Inhalt vorwählen (bevorzugt Sentry).
+                let firstSource = ClipSource.allCases.first { source in
+                    loaded.contains { $0.source == source }
+                } ?? .sentry
+                self.source = firstSource
+                self.selectedEvent = loaded.first { $0.source == firstSource }
                 self.isLoading = false
                 self.hasLoaded = true
             }
@@ -71,10 +93,17 @@ struct ContentView: View {
 
 struct SidebarView: View {
     let events: [SentryEvent]
+    @Binding var source: ClipSource
+    let sourceCounts: [ClipSource: Int]
     @Binding var selectedEvent: SentryEvent?
     let isLoading: Bool
     let hasLoaded: Bool
     let onSelectFolder: () -> Void
+
+    /// Quellen, die tatsächlich Ereignisse enthalten.
+    private var availableSources: [ClipSource] {
+        ClipSource.allCases.filter { (sourceCounts[$0] ?? 0) > 0 }
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -94,6 +123,20 @@ struct SidebarView: View {
                 }
             }
             .padding(10)
+
+            // Quellen-Umschalter (nur wenn mehr als eine Quelle Inhalt hat)
+            if availableSources.count > 1 {
+                Picker("Quelle", selection: $source) {
+                    ForEach(availableSources) { src in
+                        Label("\(src.displayName) (\(sourceCounts[src] ?? 0))", systemImage: src.systemIcon)
+                            .tag(src)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .padding(.horizontal, 10)
+                .padding(.bottom, 8)
+            }
 
             Divider()
 
@@ -201,6 +244,8 @@ struct PlaceholderView: View {
 #Preview("Sidebar mit Events") {
     SidebarView(
         events: SentryEvent.previewList,
+        source: .constant(.sentry),
+        sourceCounts: [.sentry: 2, .saved: 1],
         selectedEvent: .constant(nil),
         isLoading: false,
         hasLoaded: true,
@@ -212,6 +257,8 @@ struct PlaceholderView: View {
 #Preview("Sidebar leer") {
     SidebarView(
         events: [],
+        source: .constant(.sentry),
+        sourceCounts: [:],
         selectedEvent: .constant(nil),
         isLoading: false,
         hasLoaded: false,
@@ -223,6 +270,8 @@ struct PlaceholderView: View {
 #Preview("Sidebar keine Ergebnisse") {
     SidebarView(
         events: [],
+        source: .constant(.sentry),
+        sourceCounts: [:],
         selectedEvent: .constant(nil),
         isLoading: false,
         hasLoaded: true,

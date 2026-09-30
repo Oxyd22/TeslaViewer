@@ -37,6 +37,9 @@ playground.xcworkspace
 # Swift Package Manager
 .swiftpm/
 .build/
+
+# Build output (bundle.sh)
+/TeslaViewer.app/
 Packages/
 Package.pins
 Package.resolved

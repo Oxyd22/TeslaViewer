@@ -8,25 +8,27 @@ TeslaViewer is a macOS app for viewing Tesla Dashcam and Sentry Mode recordings.
 
 ## Build & Test Commands
 
-Use the Xcode MCP tools for all build/test operations:
+This is a pure **Swift Package** (no `.xcodeproj`). Use the SwiftPM CLI:
 
-- **Build**: Use `BuildProject` MCP tool
-- **Run all tests**: Use `RunAllTests` MCP tool
-- **Run specific test**: Use `RunSomeTests` MCP tool with `targetName: "TeslaViewerTests"` and the test identifier
-- **Quick diagnostics**: Use `XcodeRefreshCodeIssuesInFile` for fast compiler feedback without a full build
+- **Build**: `swift build`
+- **Run all tests**: `swift test`
+- **Run a specific test**: `swift test --filter TeslaViewerTests.testLoadEvents`
+- **Run the app (dev)**: `swift run TeslaViewer` — startet das Programm direkt (ohne App-Bundle)
+- **Distributierbares .app bauen**: `./bundle.sh` → erzeugt `TeslaViewer.app` (Release, ad-hoc signiert)
 
 ## Architecture
 
-The app is split into focused files under `TeslaViewer/TeslaViewer/`:
+The app is split into focused files under `Sources/TeslaViewer/`:
 
 | Datei | Inhalt |
 |-------|--------|
-| `Models.swift` | `EventReason`, `SentryClip`, `SentryEvent` + Preview-Beispieldaten |
-| `EventLoader.swift` | `EventLoader` — Filesystem-Scanner und Parser |
-| `VideoPlayerManager.swift` | `VideoPlayerManager` — `@MainActor @Observable`, verwaltet alle AVPlayer |
-| `VideoGridView.swift` | `VideoGridView`, `CameraCell`, `PlayerView` (NSViewRepresentable) |
-| `ContentView.swift` | `ContentView`, `SidebarView`, `EventRowView`, `PlaceholderView` |
-| `TeslaViewerApp.swift` | App-Entry-Point, WindowGroup-Konfiguration |
+| `Models.swift` | `ClipSource`, `EventReason`, `SentryClip`, `SentryEvent` (inkl. GPS) + Preview-Beispieldaten |
+| `EventLoader.swift` | `EventLoader` — Filesystem-Scanner und Parser (alle drei Quellen) |
+| `VideoPlayerManager.swift` | `VideoPlayerManager` — `@MainActor @Observable`, verwaltet alle AVPlayer + durchgehende Timeline |
+| `ClipExporter.swift` | `ClipExporter` — Finder, Einzelkamera-Kopie, 6-Kamera-Grid-Export (AVMutableVideoComposition) |
+| `VideoGridView.swift` | `VideoGridView`, `MapPopover`, `ExportOverlay`, `CameraCell`, `PlayerView` (NSViewRepresentable) |
+| `ContentView.swift` | `ContentView`, `SidebarView` (mit Quellen-Umschalter), `EventRowView`, `PlaceholderView` |
+| `TeslaViewerApp.swift` | App-Entry-Point, `AppDelegate` (Aktivierungs-Policy), WindowGroup-Konfiguration |
 
 ### Data Flow
 
@@ -38,7 +40,9 @@ TeslaViewerApp → ContentView → SidebarView + VideoGridView
 
 ### Key Types
 
-- **`EventLoader`** (enum, static methods) — Scans the filesystem. Accepts a TeslaCam root folder, a SentryClips folder, or any subfolder. Parses event folders named `YYYY-MM-DD_HH-mm-ss`, reads `event.json` for metadata, and groups MP4 files by timestamp prefix into `SentryClip` objects.
+- **`ClipSource`** (enum) — Die drei Quell-Ordner: `.sentry` (`SentryClips`), `.saved` (`SavedClips`), `.recent` (`RecentClips`). Liefert `folderName`, `displayName`, `systemIcon`.
+
+- **`EventLoader`** (enum, static methods) — Scans the filesystem. `loadAll(from:)` lädt alle drei Quellen; `resolveBase(_:)` akzeptiert USB-Root (mit `TeslaCam`), den `TeslaCam`-Ordner selbst oder direkt einen Quell-Ordner. Parst Event-Ordner `YYYY-MM-DD_HH-mm-ss` mit `event.json` (inkl. GPS `est_lat`/`est_lon`). `RecentClips` ist ein flacher Ordner ohne `event.json` → alle Minuten-Segmente werden zu **einem** synthetischen Ereignis gebündelt. Gruppiert MP4s per Timestamp-Prefix zu `SentryClip`.
 
 - **`SentryEvent`** — One trigger event (one folder). All properties are `let` (immutable). Contains metadata (`city`, `reason`, `thumbnailURL`) and an array of `SentryClip` objects sorted chronologically.
 
@@ -46,7 +50,9 @@ TeslaViewerApp → ContentView → SidebarView + VideoGridView
 
 - **`EventReason`** — Wraps the raw reason string from `event.json` and maps it to localized German display strings and SF Symbols.
 
-- **`VideoPlayerManager`** (`@MainActor @Observable`) — Owns all `AVPlayer` instances for the current clip. Tracks time via a periodic observer on the "front" camera player (fallback: first available). Handles clip navigation, seek, and play/pause across all cameras simultaneously.
+- **`VideoPlayerManager`** (`@MainActor @Observable`) — Owns all `AVPlayer` instances for the current clip. Tracks time via a periodic observer on the "front" camera player (fallback: first available). Handles clip navigation, seek, and play/pause across all cameras simultaneously. **Durchgehende Timeline:** lädt die Dauer aller Segmente asynchron (`loadAllDurations`), bildet kumulierte Startzeiten (`clipStarts`/`totalDuration`) und stellt `globalTime` + `seekToGlobal(_:)` bereit, das bei Bedarf das Segment wechselt.
+
+- **`ClipExporter`** (enum) — `revealInFinder`, `copyCamera` (verlustfreie Einzelkamera-Kopie) und `exportGrid` (rechnet die 6 Kameras eines Clips per `AVMutableComposition` + `AVMutableVideoComposition` in ein 3×2-Raster und exportiert eine MP4). **Wichtig:** Alle Spuren werden auf die gemeinsame Mindestlänge getrimmt (sonst `AVErrorInvalidVideoComposition -11841`), und die Quell-`AVURLAsset`s müssen bis zum `insertTimeRange` festgehalten werden (sonst wird die `AVAssetTrack` ungültig).
 
 - **`VideoGridView`** — Detail view. Renders a fixed 3×2 camera layout using SwiftUI `Grid`. Supports keyboard shortcuts (Space, arrow keys).
 
@@ -64,14 +70,16 @@ Camera name keys used throughout the app: `front`, `back`, `left_repeater`, `rig
 ## Tests
 
 Unit tests use Swift's `Testing` framework (`@Test` macros, `#expect`).
-UI tests use `XCUITest` framework.
-Tests are in `TeslaViewerTests/TeslaViewerTests.swift` and cover `EventLoader`, `EventReason`, date parsing, and `VideoPlayerManager` initialization.
+Tests are in `Tests/TeslaViewerTests/TeslaViewerTests.swift` and cover `EventLoader`, `EventReason`, date parsing, and `VideoPlayerManager` initialization. The test target does `@testable import TeslaViewer` against the executable target.
+UI tests (`XCUITest`) were removed in the SwiftPM-Umbau — XCUITest requires an Xcode project.
 
 ## Notes
 
-- The app is **macOS-only**. Uses `NSOpenPanel`, `NSViewRepresentable`, `AVPlayerView`, and `Color(NSColor.windowBackgroundColor)`.
+- The app is **macOS-only**. Uses `NSOpenPanel`, `NSSavePanel`, `NSViewRepresentable`, `AVPlayerView`, MapKit (`Map`/`MKMapItem`), `NSWorkspace`, and `Color(NSColor.windowBackgroundColor)`.
 - UI strings **and source code comments** are in **German** (this is intentional — the app targets German-speaking users). New UI text and comments should also be in German.
 - Uses `@Observable` (not `ObservableObject`/Combine). Prefer async/await for new async work.
 - `Item.swift` (SwiftData scaffold) is unused and can be ignored.
 - Minimum window size is 1000×680 pt (enforced in `TeslaViewerApp`).
 - Preview-Beispieldaten sind in `Models.swift` als `SentryEvent.preview` / `.previewList` verfügbar.
+- `TeslaViewerApp` setzt via `AppDelegate` die Aktivierungs-Policy auf `.regular` — nötig, weil ein SwiftPM-Executable sonst ohne Vordergrund-Fenster startet (kein App-Bundle/Info.plist).
+- **Asset-Hinweis**: Bei `swift run` werden `AppIcon`/`AccentColor` aus `Assets.xcassets` **nicht** automatisch angewendet (SwiftUI lädt sie nur aus dem Main-Bundle eines echten `.app`). Der AppIcon-Satz enthält ohnehin noch keine Bilddateien.

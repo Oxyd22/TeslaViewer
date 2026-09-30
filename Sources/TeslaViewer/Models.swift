@@ -6,6 +6,43 @@
 //
 
 import Foundation
+import CoreLocation
+
+// MARK: - ClipSource
+
+/// Die drei Quell-Ordner, die Tesla auf dem USB-Stick anlegt.
+enum ClipSource: String, CaseIterable, Identifiable, Sendable {
+    case sentry
+    case saved
+    case recent
+
+    var id: String { rawValue }
+
+    /// Ordnername im TeslaCam-Verzeichnis.
+    var folderName: String {
+        switch self {
+        case .sentry: "SentryClips"
+        case .saved:  "SavedClips"
+        case .recent: "RecentClips"
+        }
+    }
+
+    var displayName: String {
+        switch self {
+        case .sentry: "Sentry"
+        case .saved:  "Gespeichert"
+        case .recent: "Letzte"
+        }
+    }
+
+    var systemIcon: String {
+        switch self {
+        case .sentry: "shield.lefthalf.filled"
+        case .saved:  "bookmark.fill"
+        case .recent: "clock.fill"
+        }
+    }
+}
 
 // MARK: - EventReason
 
@@ -55,8 +92,17 @@ struct SentryEvent: Identifiable, Hashable, Sendable {
     let reason: String?
     let thumbnailURL: URL?
     let clips: [SentryClip]
+    let source: ClipSource
+    let latitude: Double?
+    let longitude: Double?
 
     var reasonInfo: EventReason { EventReason(raw: reason ?? "") }
+
+    /// GPS-Position aus `event.json` (`est_lat`/`est_lon`), falls vorhanden.
+    var coordinate: CLLocationCoordinate2D? {
+        guard let latitude, let longitude else { return nil }
+        return CLLocationCoordinate2D(latitude: latitude, longitude: longitude)
+    }
 
     var displayDate: String {
         eventTimestamp.formatted(
@@ -83,7 +129,10 @@ extension SentryEvent {
         clips: [
             SentryClip(clipTimestamp: Date(timeIntervalSince1970: 1_735_000_000), cameraURLs: [:]),
             SentryClip(clipTimestamp: Date(timeIntervalSince1970: 1_735_000_060), cameraURLs: [:]),
-        ]
+        ],
+        source: .sentry,
+        latitude: 52.5200,
+        longitude: 13.4050
     )
 
     static let previewList: [SentryEvent] = [
@@ -96,7 +145,10 @@ extension SentryEvent {
             thumbnailURL: nil,
             clips: [
                 SentryClip(clipTimestamp: Date(timeIntervalSince1970: 1_734_900_000), cameraURLs: [:])
-            ]
+            ],
+            source: .saved,
+            latitude: 48.1351,
+            longitude: 11.5820
         ),
         SentryEvent(
             folderURL: URL(fileURLWithPath: "/tmp/2025-12-21_14-15-00"),
@@ -106,7 +158,10 @@ extension SentryEvent {
             thumbnailURL: nil,
             clips: [
                 SentryClip(clipTimestamp: Date(timeIntervalSince1970: 1_734_800_000), cameraURLs: [:])
-            ]
+            ],
+            source: .sentry,
+            latitude: nil,
+            longitude: nil
         ),
     ]
 }

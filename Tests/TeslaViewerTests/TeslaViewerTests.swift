@@ -54,6 +54,65 @@ struct TeslaViewerTests {
         #expect(await events.first?.clips.first?.cameraURLs["right_pillar"] != nil)
     }
 
+    @Test func testLoadAllSourcesAndGPS() async throws {
+        // TeslaCam-Struktur mit allen drei Quellen aufbauen.
+        let base = FileManager.default.temporaryDirectory
+            .appendingPathComponent("TestTeslaCam-\(UUID().uuidString)")
+        let fm = FileManager.default
+        defer { try? fm.removeItem(at: base) }
+
+        func writeEvent(in parent: URL, folder: String, json: String, cameras: [String]) throws {
+            let dir = parent.appendingPathComponent(folder)
+            try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            for cam in cameras {
+                fm.createFile(atPath: dir.appendingPathComponent("\(folder)-\(cam).mp4").path, contents: Data())
+            }
+            fm.createFile(atPath: dir.appendingPathComponent("event.json").path, contents: json.data(using: .utf8))
+        }
+
+        let sentry = base.appendingPathComponent("SentryClips")
+        let saved  = base.appendingPathComponent("SavedClips")
+        let recent = base.appendingPathComponent("RecentClips")
+        try fm.createDirectory(at: recent, withIntermediateDirectories: true)
+
+        // Sentry-Ereignis mit GPS
+        try writeEvent(
+            in: sentry, folder: "2025-06-19_09-11-47",
+            json: "{\"city\":\"Marne-la-Vallée\",\"reason\":\"sentry_aware_object_detection\",\"est_lat\":\"48.8277\",\"est_lon\":\"2.81941\"}",
+            cameras: ["front", "back"]
+        )
+        // Gespeichertes Ereignis
+        try writeEvent(
+            in: saved, folder: "2026-06-08_21-27-34",
+            json: "{\"reason\":\"user_interaction_dashcam_icon_tapped\"}",
+            cameras: ["front"]
+        )
+        // RecentClips: flacher Puffer, zwei Minuten-Segmente, kein event.json
+        for minute in ["2026-06-09_07-21-20", "2026-06-09_07-22-20"] {
+            for cam in ["front", "back"] {
+                fm.createFile(atPath: recent.appendingPathComponent("\(minute)-\(cam).mp4").path, contents: Data())
+            }
+        }
+
+        let all = EventLoader.loadAll(from: base)
+
+        // Je Quelle ein Ereignis (Recent bündelt seine Segmente zu einem).
+        #expect(all.filter { $0.source == .sentry }.count == 1)
+        #expect(all.filter { $0.source == .saved }.count == 1)
+        #expect(all.filter { $0.source == .recent }.count == 1)
+
+        let sentryEvent = try #require(all.first { $0.source == .sentry })
+        #expect(sentryEvent.city == "Marne-la-Vallée")
+        #expect(sentryEvent.latitude == 48.8277)
+        #expect(sentryEvent.longitude == 2.81941)
+        #expect(sentryEvent.coordinate != nil)
+
+        // RecentClips: ein Ereignis mit zwei Clips, ohne GPS.
+        let recentEvent = try #require(all.first { $0.source == .recent })
+        #expect(recentEvent.clips.count == 2)
+        #expect(recentEvent.coordinate == nil)
+    }
+
     @Test func testEventReasonMapping() throws {
         // Test event reason display strings
         let objectDetection = EventReason(raw: "sentry_aware_object_detection")
